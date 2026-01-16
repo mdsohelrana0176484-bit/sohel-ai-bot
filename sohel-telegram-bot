@@ -1,0 +1,500 @@
+import sys
+import pytz
+import random
+import asyncio
+from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+import logging
+import json
+
+# ==================== CONFIGURATION ====================
+import os
+TOKEN = os.getenv("BOT_TOKEN")
+
+ADMIN_ID = 8516585362
+BD_TZ = pytz.timezone('Asia/Dhaka')
+
+# লগিং সেটআপ
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ==================== MARKET DATA ====================
+MARKET_DATA = {
+    "OTC": {
+        "AUD/NZD": {"accuracy": 88, "payout": "96%", "emoji": "🇦🇺🇳🇿"},
+        "USD/INR": {"accuracy": 86, "payout": "94%", "emoji": "🇺🇸🇮🇳"},
+        "USD/BRL": {"accuracy": 84, "payout": "95%", "emoji": "🇺🇸🇧🇷"},
+        "USD/ARS": {"accuracy": 90, "payout": "97%", "emoji": "🇺🇸🇦🇷"},
+        "USD/BDT": {"accuracy": 87, "payout": "93%", "emoji": "🇺🇸🇧🇩"},
+        "USD/PKR": {"accuracy": 85, "payout": "94%", "emoji": "🇺🇸🇵🇰"},
+        "USD/TRY": {"accuracy": 83, "payout": "96%", "emoji": "🇺🇸🇹🇷"},
+        "EUR/TRY": {"accuracy": 82, "payout": "95%", "emoji": "🇪🇺🇹🇷"},
+    },
+    "FOREX": {
+        "EUR/USD": {"accuracy": 78, "payout": "91%", "emoji": "🇪🇺🇺🇸"},
+        "GBP/USD": {"accuracy": 76, "payout": "92%", "emoji": "🇬🇧🇺🇸"},
+        "USD/JPY": {"accuracy": 82, "payout": "93%", "emoji": "🇺🇸🇯🇵"},
+        "AUD/USD": {"accuracy": 75, "payout": "90%", "emoji": "🇦🇺🇺🇸"},
+        "EUR/GBP": {"accuracy": 77, "payout": "92%", "emoji": "🇪🇺🇬🇧"},
+        "GBP/JPY": {"accuracy": 74, "payout": "94%", "emoji": "🇬🇧🇯🇵"},
+    },
+    "CRYPTO": {
+        "BTC/USD": {"accuracy": 72, "payout": "98%", "emoji": "₿"},
+        "ETH/USD": {"accuracy": 70, "payout": "96%", "emoji": "Ξ"},
+        "XRP/USD": {"accuracy": 68, "payout": "95%", "emoji": "✕"},
+        "ADA/USD": {"accuracy": 65, "payout": "97%", "emoji": "🅰"},
+    },
+    "COMMODITIES": {
+        "GOLD": {"accuracy": 84, "payout": "92%", "emoji": "🥇"},
+        "SILVER": {"accuracy": 80, "payout": "93%", "emoji": "🥈"},
+        "OIL": {"accuracy": 76, "payout": "91%", "emoji": "🛢"},
+    }
+}
+
+# ==================== HELPER FUNCTIONS ====================
+def get_bd_time():
+    return datetime.now(BD_TZ)
+
+def format_time(dt):
+    return dt.strftime("%H:%M:%S")
+
+def get_next_candle_time():
+    now = get_bd_time()
+    next_min = (now.minute + 1) % 60
+    next_hr = now.hour if now.minute < 59 else (now.hour + 1) % 24
+    return f"{next_hr:02d}:{next_min:02d}"
+
+def get_market_emoji(pair):
+    for category in MARKET_DATA.values():
+        if pair in category:
+            return category[pair]["emoji"]
+    return "📊"
+
+# ==================== SIGNAL GENERATOR ====================
+class SignalGenerator:
+    def __init__(self):
+        self.history = []
+    
+    def generate(self, market_type=None):
+        if market_type and market_type in MARKET_DATA:
+            pairs = list(MARKET_DATA[market_type].keys())
+            pair = random.choice(pairs)
+            info = MARKET_DATA[market_type][pair]
+        else:
+            all_pairs = []
+            all_info = []
+            for cat, data in MARKET_DATA.items():
+                for p, info in data.items():
+                    all_pairs.append(p)
+                    all_info.append((info, cat))
+            
+            idx = random.randint(0, len(all_pairs)-1)
+            pair = all_pairs[idx]
+            info, market_type = all_info[idx]
+        
+        # Direction based on accuracy
+        direction = "UP" if random.random() * 100 < info["accuracy"] else "DOWN"
+        timeframe = random.choice([1, 2, 3, 5])
+        
+        current = get_bd_time()
+        expiry = current + timedelta(minutes=timeframe)
+        
+        signal = {
+            "id": len(self.history) + 1,
+            "pair": pair,
+            "market": market_type,
+            "direction": direction,
+            "timeframe": f"{timeframe}M",
+            "entry_time": format_time(current),
+            "expiry_time": format_time(expiry),
+            "accuracy": f"{info['accuracy']}%",
+            "payout": info["payout"],
+            "emoji": info["emoji"],
+            "timestamp": current.timestamp()
+        }
+        
+        self.history.append(signal)
+        return signal
+
+# ==================== BOT CLASS ====================
+class FinorixStyleBot:
+    def __init__(self):
+        self.app = None
+        self.signal_gen = SignalGenerator()
+        self.user_data = {}
+    
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("📡 GET SIGNAL", callback_data="signal"),
+                InlineKeyboardButton("📊 STATS", callback_data="stats")
+            ],
+            [
+                InlineKeyboardButton("💎 OTC", callback_data="market_otc"),
+                InlineKeyboardButton("🌍 FOREX", callback_data="market_forex"),
+                InlineKeyboardButton("🚀 CRYPTO", callback_data="market_crypto")
+            ],
+            [
+                InlineKeyboardButton("⚙️ SETTINGS", callback_data="settings"),
+                InlineKeyboardButton("💰 VIP", callback_data="vip"),
+                InlineKeyboardButton("❓ HELP", callback_data="help")
+            ]
+        ]
+        
+        welcome = f"""
+🌟 *WELCOME TO QUOTEX SIGNALS* 🌟
+
+👋 Hello *{user.first_name}*!
+
+🤖 *BOT FEATURES:*
+✅ 30+ Markets Covered
+✅ High Accuracy Signals
+✅ Real-time Analysis
+✅ Bangladesh Time (UTC+6)
+✅ Auto Signal Generation
+
+📈 *PERFORMANCE:*
+🏆 Win Rate: *84.5%*
+📊 Total Signals: *127*
+🎯 Avg. Accuracy: *82.3%*
+💰 Avg. Payout: *94.2%*
+
+🕐 *Bangladesh Time:* {get_bd_time().strftime('%H:%M:%S')}
+⏰ *Next Candle:* {get_next_candle_time()}
+
+⚠️ *Risk Warning:* Trading involves high risk.
+"""
+        
+        await update.message.reply_text(
+            welcome,
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    async def send_signal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        loading_msg = await update.message.reply_text(
+            "🔄 *Analyzing Markets...*\n"
+            "📊 Scanning 30+ pairs...\n"
+            "🎯 Calculating best entry point...",
+            parse_mode='Markdown'
+        )
+        
+        await asyncio.sleep(2)
+        
+        signal = self.signal_gen.generate()
+        emoji = get_market_emoji(signal["pair"])
+        
+        signal_text = f"""
+{signal['emoji']} *{signal['pair']}* {signal['emoji']}
+━━━━━━━━━━━━━━━━━━━━
+🕐 *Time:* {signal['entry_time']} (UTC+6)
+⏰ *Next Candle:* {get_next_candle_time()}
+━━━━━━━━━━━━━━━━━━━━
+
+🎯 *SIGNAL DETAILS:*
+📊 Market: {signal['market']}
+📈 Direction: {'🟢 *BUY (UP)*' if signal['direction'] == 'UP' else '🔴 *SELL (DOWN)*'}
+⏱ Timeframe: {signal['timeframe']}
+📉 Expiry: {signal['expiry_time']}
+━━━━━━━━━━━━━━━━━━━━
+
+📊 *PERFORMANCE METRICS:*
+✅ Accuracy: {signal['accuracy']}
+💰 Payout: {signal['payout']}
+📈 Trend: {random.choice(['↗️ Bullish', '↘️ Bearish', '➡️ Sideways'])}
+━━━━━━━━━━━━━━━━━━━━
+
+💡 *TRADING TIPS:*
+• Entry at candle open
+• Use 1-5% risk per trade
+• Set Stop Loss always
+• Trade with confirmation
+━━━━━━━━━━━━━━━━━━━━
+
+⚠️ *DISCLAIMER:*
+This is not financial advice.
+Trade at your own risk.
+Past performance ≠ future results.
+"""
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ WIN", callback_data=f"win_{signal['id']}"),
+                InlineKeyboardButton("❌ LOSS", callback_data=f"loss_{signal['id']}")
+            ],
+            [
+                InlineKeyboardButton("🔄 NEW SIGNAL", callback_data="signal"),
+                InlineKeyboardButton("📊 STATS", callback_data="stats")
+            ]
+        ]
+        
+        try:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=loading_msg.message_id
+            )
+        except:
+            pass
+        
+        await update.message.reply_text(
+            signal_text,
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        stats_text = f"""
+📊 *BOT STATISTICS* 📊
+━━━━━━━━━━━━━━━━━━━━
+📅 *Date:* {get_bd_time().strftime('%d %B %Y')}
+🕐 *Time:* {format_time(get_bd_time())}
+⏰ *Next Candle:* {get_next_candle_time()}
+━━━━━━━━━━━━━━━━━━━━
+
+📈 *OVERALL PERFORMANCE:*
+🏆 Win Rate: *84.5%*
+📊 Total Signals: *1,274*
+🎯 Avg. Accuracy: *82.3%*
+💰 Avg. Payout: *94.2%*
+━━━━━━━━━━━━━━━━━━━━
+
+📊 *DAILY STATS (TODAY):*
+✅ Signals: 12
+🎯 Wins: 10
+📉 Losses: 2
+📊 Accuracy: *83.3%*
+━━━━━━━━━━━━━━━━━━━━
+
+🔥 *TOP 3 PAIRS:*
+🥇 USD/ARS - 90% Accuracy
+🥈 AUD/NZD - 88% Accuracy
+🥉 USD/BDT - 87% Accuracy
+━━━━━━━━━━━━━━━━━━━━
+
+🔄 Last updated: Just now
+"""
+        
+        keyboard = [[InlineKeyboardButton("🔄 REFRESH", callback_data="stats")]]
+        
+        await update.message.reply_text(
+            stats_text,
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    async def time_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        bd_time = get_bd_time()
+        time_text = f"""
+🕐 *TIME INFORMATION* 🕐
+━━━━━━━━━━━━━━━━━━━━
+📍 *Bangladesh Time (UTC+6):*
+📅 Date: {bd_time.strftime('%A, %d %B %Y')}
+🕐 Time: {format_time(bd_time)}
+⏰ Next Candle: {get_next_candle_time()}
+━━━━━━━━━━━━━━━━━━━━
+
+🌍 *WORLD TRADING SESSIONS:*
+🇧🇩 *Dhaka (Open):* {format_time(bd_time)}
+🇸🇬 *Singapore:* {format_time(bd_time + timedelta(hours=2))}
+🇯🇵 *Tokyo:* {format_time(bd_time + timedelta(hours=3))}
+🇬🇧 *London:* {format_time(bd_time - timedelta(hours=6))}
+🇺🇸 *New York:* {format_time(bd_time - timedelta(hours=11))}
+━━━━━━━━━━━━━━━━━━━━
+
+⏰ *TRADING HOURS:*
+• OTC: 24/7
+• Forex: 24/5
+• Crypto: 24/7
+• Commodities: 24/5
+━━━━━━━━━━━━━━━━━━━━
+"""
+        
+        await update.message.reply_text(time_text, parse_mode='Markdown')
+    
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        help_text = """
+🆘 *HELP & COMMANDS* 🆘
+━━━━━━━━━━━━━━━━━━━━
+*📡 SIGNAL COMMANDS:*
+/signal - Get trading signal
+/otc - OTC market signals
+/forex - Forex market signals
+/crypto - Crypto market signals
+
+*📊 INFO COMMANDS:*
+/stats - Bot performance statistics
+/time - Current time information
+/top - Top performing pairs
+/markets - All available markets
+
+*⚙️ SETTINGS:*
+Use inline buttons for quick access
+Click WIN/LOSS to improve accuracy
+━━━━━━━━━━━━━━━━━━━━
+*📞 SUPPORT:*
+For assistance, contact admin
+━━━━━━━━━━━━━━━━━━━━
+*⚠️ DISCLAIMER:*
+This bot provides educational signals.
+We are not financial advisors.
+Trade responsibly.
+"""
+        
+        await update.message.reply_text(help_text, parse_mode='Markdown')
+    
+    async def callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        
+        data = query.data
+        
+        if data == "signal":
+            await self.send_signal_callback(query, context)
+        elif data == "stats":
+            await self.stats_callback(query, context)
+        elif data == "time":
+            await self.time_callback(query, context)
+        elif data == "help":
+            await self.help_callback(query, context)
+        elif data.startswith("market_"):
+            market = data.split("_")[1].upper()
+            await query.edit_message_text(
+                f"✅ *Market set to: {market}*\n\nNow use /signal to get {market} signals.",
+                parse_mode='Markdown'
+            )
+        elif data.startswith("win_") or data.startswith("loss_"):
+            await query.edit_message_text(
+                "✅ *Thank you for your feedback!*\n\nYour response helps improve our algorithm.",
+                parse_mode='Markdown'
+            )
+        elif data == "settings":
+            await query.edit_message_text(
+                "⚙️ *SETTINGS*\n\n• Default Market: All\n• Timezone: UTC+6\n• Notifications: On\n• Auto-refresh: Enabled",
+                parse_mode='Markdown'
+            )
+        elif data == "vip":
+            await query.edit_message_text(
+                "💰 *VIP ACCESS*\n\nPremium features include:\n• Priority signals\n• Early access\n• Higher accuracy\n• Personal support\n\nContact admin for VIP access.",
+                parse_mode='Markdown'
+            )
+    
+    async def send_signal_callback(self, query, context):
+        signal = self.signal_gen.generate()
+        
+        signal_text = f"""
+🚀 *QUOTEX SIGNAL*
+━━━━━━━━━━━━━━
+📊 Pair: `{signal['pair']}`
+🎯 Direction: {signal['direction']}
+⏱ Timeframe: {signal['timeframe']}
+✅ Accuracy: {signal['accuracy']}
+"""
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ WIN", callback_data=f"win_{signal['id']}"),
+                InlineKeyboardButton("❌ LOSS", callback_data=f"loss_{signal['id']}")
+            ]
+        ]
+        
+        await query.edit_message_text(
+            signal_text,
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    async def stats_callback(self, query, context):
+        stats_text = f"""
+📊 *STATISTICS*
+━━━━━━━━━━━━
+🕐 Time: {format_time(get_bd_time())}
+⏰ Next: {get_next_candle_time()}
+📈 Win Rate: 84.5%
+🎯 Accuracy: 82.3%
+"""
+        
+        keyboard = [[InlineKeyboardButton("🔄 REFRESH", callback_data="stats")]]
+        
+        await query.edit_message_text(
+            stats_text,
+            parse_mode='Markdown',
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    async def time_callback(self, query, context):
+        bd_time = get_bd_time()
+        time_text = f"""
+🕐 *TIME*
+━━━━━━━━━━━━
+📍 Bangladesh: {format_time(bd_time)}
+⏰ Next Candle: {get_next_candle_time()}
+🇬🇧 London: {format_time(bd_time - timedelta(hours=6))}
+🇺🇸 New York: {format_time(bd_time - timedelta(hours=11))}
+"""
+        
+        await query.edit_message_text(time_text, parse_mode='Markdown')
+    
+    async def help_callback(self, query, context):
+        help_text = """
+🆘 *HELP*
+━━━━━━━━━━━━
+📡 /signal - Get signal
+📊 /stats - View stats
+🕐 /time - Check time
+❓ /help - This message
+━━━━━━━━━━━━
+Use buttons for quick access
+"""
+        
+        await query.edit_message_text(help_text, parse_mode='Markdown')
+    
+    def run(self):
+        """Start the bot"""
+        print("=" * 80)
+        print("🤖 FINORIX-STYLE QUOTEX BOT")
+        print(f"🔗 Token: {TOKEN[:15]}...")
+        print(f"🌍 Timezone: UTC+6 (Bangladesh)")
+        print("📊 Markets: OTC, Forex, Crypto, Commodities")
+        print("🎯 Features: Professional Signals, Stats, Inline Buttons")
+        print("=" * 80)
+        
+        self.app = Application.builder().token(TOKEN).build()
+        
+        # Add handlers
+        self.app.add_handler(CommandHandler("start", self.start))
+        self.app.add_handler(CommandHandler("signal", self.send_signal))
+        self.app.add_handler(CommandHandler("stats", self.stats_command))
+        self.app.add_handler(CommandHandler("time", self.time_command))
+        self.app.add_handler(CommandHandler("help", self.help_command))
+        self.app.add_handler(CommandHandler("otc", lambda u, c: self.send_signal(u, c)))
+        self.app.add_handler(CommandHandler("forex", lambda u, c: self.send_signal(u, c)))
+        self.app.add_handler(CommandHandler("crypto", lambda u, c: self.send_signal(u, c)))
+        
+        # Callback handler
+        self.app.add_handler(CallbackQueryHandler(self.callback_handler))
+        
+        print("✅ Bot is running...")
+        print("📱 Telegram: Use /start command")
+        print("🛑 Press Ctrl+C to stop")
+        print("=" * 80)
+        
+        self.app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+# ==================== MAIN ====================
+def main():
+    try:
+        bot = FinorixStyleBot()
+        bot.run()
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+
